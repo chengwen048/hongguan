@@ -887,6 +887,186 @@ def first_non_empty_result(*results):
     return next((result for result in results if result is not None), None)
 
 
+FRESHNESS_PROFILES = {
+    "daily": (10, "日频/交易日数据，正常应接近最近交易日"),
+    "weekly": (21, "周频或不定期高频数据，允许几周滞后"),
+    "monthly": (75, "月度宏观数据，通常滞后 1-2 个月发布"),
+    "quarterly": (150, "季度数据，通常滞后 1 个季度左右发布"),
+    "event": (365, "事件/报告类数据，不要求每日更新"),
+    "snapshot": (30, "实时快照类数据，接口可能不带日期字段"),
+}
+
+DATASET_FREQUENCY = {
+    "gdp": "quarterly",
+    "tushare_gdp": "quarterly",
+    "us_gdp": "quarterly",
+    "pmi": "monthly",
+    "cpi": "monthly",
+    "ppi": "monthly",
+    "retail": "monthly",
+    "investment": "monthly",
+    "exports": "monthly",
+    "imports": "monthly",
+    "m2": "monthly",
+    "social_financing": "monthly",
+    "tushare_cpi": "monthly",
+    "tushare_ppi": "monthly",
+    "tushare_m2": "monthly",
+    "tushare_social_financing": "monthly",
+    "tushare_pmi": "monthly",
+    "real_estate": "monthly",
+    "unemployment": "monthly",
+    "fx_reserves": "monthly",
+    "new_house_price": "monthly",
+    "fiscal_revenue": "monthly",
+    "industrial_value_added": "monthly",
+    "us_cpi": "monthly",
+    "us_core_cpi": "monthly",
+    "us_nonfarm": "monthly",
+    "us_unemployment": "monthly",
+    "us_retail": "monthly",
+    "us_ism_pmi": "monthly",
+    "us_trade": "monthly",
+    "lpr": "daily",
+    "dr007": "daily",
+    "tushare_hsgt_moneyflow": "daily",
+    "north": "daily",
+    "index_spot": "daily",
+    "a_spot": "snapshot",
+    "hot_rank": "daily",
+    "hot_up": "daily",
+    "fund_flow": "daily",
+    "index_pe": "daily",
+    "csindex_valuation": "daily",
+    "fx": "snapshot",
+    "fx_boc_safe": "daily",
+    "dxy": "daily",
+    "commodity": "daily",
+    "us_rate": "event",
+    "cn_us_rate_spread": "daily",
+    "commodity_price": "weekly",
+    "au_report": "event",
+    "news": "daily",
+    "xinwen_lianbo": "daily",
+    "mx_search": "daily",
+    "mx_finance": "daily",
+}
+
+
+def dataset_latest_timestamp(df: pd.DataFrame) -> tuple[pd.Timestamp | None, str]:
+    if df is None or df.empty:
+        return None, ""
+    for col in ("date", "日期", "trade_date", "ann_date", "end_date", "quarter", "报告期", "抓取日期", "created_at"):
+        if col not in df.columns:
+            continue
+        raw = df[col].astype(str)
+        normalized = raw.str.replace("Q1", "-03-01", regex=False).str.replace("Q2", "-06-01", regex=False).str.replace("Q3", "-09-01", regex=False).str.replace("Q4", "-12-01", regex=False)
+        mask8 = normalized.str.fullmatch(r"\d{8}")
+        normalized.loc[mask8] = normalized.loc[mask8].str[:4] + "-" + normalized.loc[mask8].str[4:6] + "-" + normalized.loc[mask8].str[6:8]
+        mask6 = normalized.str.fullmatch(r"\d{6}")
+        normalized.loc[mask6] = normalized.loc[mask6].str[:4] + "-" + normalized.loc[mask6].str[4:6] + "-01"
+        parsed = pd.to_datetime(normalized, errors="coerce")
+        if parsed.notna().sum():
+            latest = parsed.max()
+            return latest, latest.strftime("%Y-%m-%d")
+    return None, ""
+
+
+def latest_refresh_row(refresh_log: pd.DataFrame, dataset: str) -> dict[str, Any]:
+    if refresh_log.empty or "dataset" not in refresh_log.columns:
+        return {}
+    part = refresh_log[refresh_log["dataset"] == dataset]
+    if part.empty:
+        return {}
+    return part.iloc[0].to_dict()
+
+
+def freshness_status(dataset: str, result: DataResult, refresh_row: dict[str, Any]) -> tuple[str, int | None, str]:
+    rows = 0 if result is None or result.data.empty else len(result.data)
+    error = str(refresh_row.get("error") or "")
+    refresh_status_value = str(refresh_row.get("status") or "")
+    if rows == 0:
+        if error or refresh_status_value == "error":
+            return "无数据 / 需要替代源", None, error[:180] or "最近刷新失败"
+        return "无数据 / 等待首次落库", None, "本地库暂无记录"
+    latest_ts, _ = dataset_latest_timestamp(result.data)
+    freq = DATASET_FREQUENCY.get(dataset, "monthly")
+    max_days, note = FRESHNESS_PROFILES[freq]
+    if latest_ts is None:
+        if freq == "snapshot":
+            return "实时快照 / 无日期字段", None, note
+        return "有数据但无日期字段", None, "无法判断数据新鲜度，需检查字段结构"
+    lag_days = int((pd.Timestamp(datetime.now().date()) - latest_ts.normalize()).days)
+    if lag_days <= max_days:
+        return "正常", lag_days, note
+    if lag_days <= max_days * 2:
+        return "偏旧 / 需关注", lag_days, f"{note}；已超过预期窗口"
+    return "明显滞后 / 需要替代源", lag_days, f"{note}；滞后时间过长，建议补备用接口"
+
+
+def build_freshness_table(macro, tushare_data, market, global_data, mx_data, news, xinwen_lianbo, refresh_log: pd.DataFrame) -> pd.DataFrame:
+    groups: list[tuple[str, dict[str, DataResult]]] = [
+        ("宏观", macro),
+        ("Tushare", tushare_data),
+        ("市场", market),
+        ("外部", global_data),
+        ("东方财富妙想", mx_data),
+        ("新闻", {"news": news, "xinwen_lianbo": xinwen_lianbo}),
+    ]
+    rows = []
+    for group_name, group in groups:
+        for dataset, result in group.items():
+            refresh_row = latest_refresh_row(refresh_log, dataset)
+            latest_ts, latest_text = dataset_latest_timestamp(result.data if result else pd.DataFrame())
+            status_text, lag_days, note = freshness_status(dataset, result, refresh_row)
+            rows.append(
+                {
+                    "分组": group_name,
+                    "数据集": dataset,
+                    "指标": getattr(result, "name", ""),
+                    "本地行数": 0 if result is None or result.data.empty else len(result.data),
+                    "最新数据日期": latest_text or "无日期字段",
+                    "滞后天数": "" if lag_days is None else lag_days,
+                    "新鲜度状态": status_text,
+                    "预期频率": DATASET_FREQUENCY.get(dataset, "monthly"),
+                    "最近刷新时间": refresh_row.get("created_at", ""),
+                    "最近刷新状态": refresh_row.get("status", ""),
+                    "说明/错误": (str(refresh_row.get("error") or note))[:240],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def render_freshness_page(freshness_df: pd.DataFrame):
+    st.markdown("### 数据新鲜度")
+    st.caption("按每个指标的正常发布周期判断：月度/季度宏观数据不要求更新到今天；日频行情、汇率、北向、新闻应尽量接近最近交易日。")
+    if freshness_df.empty:
+        st.info("暂无数据新鲜度记录。")
+        return
+    counts = freshness_df["新鲜度状态"].value_counts()
+    cols = st.columns(5)
+    for col, label in zip(cols, ["正常", "偏旧 / 需关注", "明显滞后 / 需要替代源", "无数据 / 需要替代源", "实时快照 / 无日期字段"]):
+        col.metric(label, int(counts.get(label, 0)))
+    status_filter = st.multiselect(
+        "按状态筛选",
+        options=sorted(freshness_df["新鲜度状态"].unique().tolist()),
+        default=sorted(freshness_df["新鲜度状态"].unique().tolist()),
+    )
+    filtered = freshness_df[freshness_df["新鲜度状态"].isin(status_filter)].copy()
+    status_order = {
+        "无数据 / 需要替代源": 0,
+        "明显滞后 / 需要替代源": 1,
+        "偏旧 / 需关注": 2,
+        "有数据但无日期字段": 3,
+        "实时快照 / 无日期字段": 4,
+        "无数据 / 等待首次落库": 5,
+        "正常": 6,
+    }
+    filtered["_order"] = filtered["新鲜度状态"].map(status_order).fillna(9)
+    filtered = filtered.sort_values(["_order", "分组", "数据集"]).drop(columns=["_order"])
+    st.dataframe(filtered, width="stretch", hide_index=True, height=620)
+
+
 def render_source_grid(items: list[tuple[str, Any]], rows: int = 8):
     available = [(title, result) for title, result in items if result is not None and not result.data.empty]
     if not available:
@@ -922,7 +1102,7 @@ with st.sidebar:
     st.header("目录")
     page = st.radio(
         "选择页面",
-        ["总览", "政策与经济", "流动性", "盈利与估值", "外部环境", "行业热点", "主要风险", "数据源状态", "AI分析过程", "报告日志", "最终结论"],
+        ["总览", "政策与经济", "流动性", "盈利与估值", "外部环境", "行业热点", "主要风险", "数据新鲜度", "数据源状态", "AI分析过程", "报告日志", "最终结论"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -1246,6 +1426,10 @@ if page == "数据源状态":
     dataframe_preview(news, rows=20, height=360)
     st.markdown("### 增量更新记录")
     st.dataframe(refresh_log, width="stretch", hide_index=True, height=420)
+
+if page == "数据新鲜度":
+    freshness_df = build_freshness_table(macro, tushare_data, market, global_data, mx_data, news, xinwen_lianbo, refresh_log)
+    render_freshness_page(freshness_df)
 
 if page == "AI分析过程":
     st.markdown("### AI分析过程")
