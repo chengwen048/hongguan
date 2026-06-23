@@ -880,6 +880,13 @@ def first_latest(groups: list[dict[str, Any]], keys: list[str]) -> float | None:
     return None
 
 
+def first_non_empty_result(*results):
+    for result in results:
+        if result is not None and not result.data.empty:
+            return result
+    return next((result for result in results if result is not None), None)
+
+
 def render_source_grid(items: list[tuple[str, Any]], rows: int = 8):
     available = [(title, result) for title, result in items if result is not None and not result.data.empty]
     if not available:
@@ -1003,17 +1010,17 @@ if page == "总览":
 
     cols = st.columns(6)
     with cols[0]:
-        metric_card("GDP同比", tushare_data.get("tushare_gdp") or macro.get("gdp"), "%")
+        metric_card("GDP同比", first_non_empty_result(tushare_data.get("tushare_gdp"), macro.get("gdp")), "%")
     with cols[1]:
-        metric_card("制造业PMI", tushare_data.get("tushare_pmi") or macro.get("pmi"))
+        metric_card("制造业PMI", first_non_empty_result(tushare_data.get("tushare_pmi"), macro.get("pmi")))
     with cols[2]:
-        metric_card("CPI同比", tushare_data.get("tushare_cpi") or macro.get("cpi"), "%")
+        metric_card("CPI同比", first_non_empty_result(tushare_data.get("tushare_cpi"), macro.get("cpi")), "%")
     with cols[3]:
-        metric_card("PPI同比", tushare_data.get("tushare_ppi") or macro.get("ppi"), "%")
+        metric_card("PPI同比", first_non_empty_result(tushare_data.get("tushare_ppi"), macro.get("ppi")), "%")
     with cols[4]:
-        metric_card("M2同比", tushare_data.get("tushare_m2") or macro.get("m2"), "%")
+        metric_card("M2同比", first_non_empty_result(tushare_data.get("tushare_m2"), macro.get("m2")), "%")
     with cols[5]:
-        metric_card("社融", tushare_data.get("tushare_social_financing") or macro.get("social_financing"))
+        metric_card("社融", first_non_empty_result(tushare_data.get("tushare_social_financing"), macro.get("social_financing")))
 
     if not refresh_log.empty:
         updated_at, next_at = refresh_times(refresh_log)
@@ -1066,8 +1073,8 @@ elif page == "流动性":
     st.write(scores["liquidity"].conclusion)
     render_source_grid(
         [
-            ("M2 同比", tushare_data.get("tushare_m2") or macro.get("m2")),
-            ("社融规模", tushare_data.get("tushare_social_financing") or macro.get("social_financing")),
+            ("M2 同比", first_non_empty_result(tushare_data.get("tushare_m2"), macro.get("m2"))),
+            ("社融规模", first_non_empty_result(tushare_data.get("tushare_social_financing"), macro.get("social_financing"))),
             ("DR/SHIBOR", macro.get("dr007")),
             ("LPR", macro.get("lpr")),
             ("Tushare北向资金", tushare_data.get("tushare_hsgt_moneyflow")),
@@ -1085,7 +1092,7 @@ elif page == "盈利与估值":
     st.write(scores["valuation"].conclusion)
     render_source_grid(
         [
-            ("PPI 同比", tushare_data.get("tushare_ppi") or macro.get("ppi")),
+            ("PPI 同比", first_non_empty_result(tushare_data.get("tushare_ppi"), macro.get("ppi"))),
             ("指数估值", market.get("index_pe")),
             ("主要指数", market.get("index_spot")),
             ("A股行情", market.get("a_spot")),

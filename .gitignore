@@ -13,3 +13,4 @@ tmp/
 *.err
 .DS_Store
 assets/test_report_export.pdf
+tmp_server_env_command.sh
