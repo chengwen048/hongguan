@@ -346,6 +346,18 @@ def dual_time_text(value: Any, delta: timedelta | None = None) -> str:
     return f"中国 {cn} / 英国 {uk}"
 
 
+def dual_time_parts(value: Any, delta: timedelta | None = None) -> tuple[str, str]:
+    dt = parse_local_time(value)
+    if dt is None:
+        fallback = "暂无" if value in (None, "") else str(value)
+        return fallback, fallback
+    if delta is not None:
+        dt = dt + delta
+    cn = dt.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    uk = dt.astimezone(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return cn, uk
+
+
 def dual_time_short(value: Any) -> str:
     dt = parse_local_time(value)
     if dt is None:
@@ -384,25 +396,46 @@ def ai_report_times() -> tuple[str, str, str]:
 
 
 def render_update_status(refresh_log: pd.DataFrame):
-    updated_at, next_at = refresh_times(refresh_log)
     if refresh_log.empty:
         inserted = updated = 0
+        latest_value = None
     else:
         inserted = int(refresh_log.head(50)["rows_inserted"].sum())
         updated = int(refresh_log.head(50)["rows_updated"].sum())
-    cols = st.columns(4)
-    cols[0].metric("数据更新到", updated_at)
-    cols[1].metric("下次自动更新", next_at)
-    cols[2].metric("近期新增", inserted)
-    cols[3].metric("近期修订", updated)
+        latest_value = refresh_log["created_at"].iloc[0]
+
+    st.markdown("#### 数据更新时间")
+    latest_cn, latest_uk = dual_time_parts(latest_value)
+    next_cn, next_uk = dual_time_parts(latest_value, timedelta(seconds=REFRESH_SECONDS)) if latest_value else ("等待首次更新", "等待首次更新")
+    st.caption("数据更新到")
+    time_cols = st.columns(2)
+    time_cols[0].metric("中国时间", latest_cn)
+    time_cols[1].metric("英国时间", latest_uk)
+    st.caption("下次自动更新")
+    next_cols = st.columns(2)
+    next_cols[0].metric("中国时间", next_cn)
+    next_cols[1].metric("英国时间", next_uk)
+    stat_cols = st.columns(2)
+    stat_cols[0].metric("近期新增", inserted)
+    stat_cols[1].metric("近期修订", updated)
 
 
 def render_ai_report_status():
-    report_at, next_report_at, status = ai_report_times()
-    cols = st.columns(3)
-    cols[0].metric("AI报告更新到", report_at)
-    cols[1].metric("下次AI报告", next_report_at)
-    cols[2].metric("最近报告状态", status)
+    reports = latest_ai_reports(1)
+    report_value = None if reports.empty else reports["created_at"].iloc[0]
+    status = "暂无" if reports.empty else str(reports["status"].iloc[0])
+    report_cn, report_uk = dual_time_parts(report_value)
+    next_cn, next_uk = dual_time_parts(report_value, timedelta(hours=12)) if report_value else ("等待首次报告", "等待首次报告")
+    st.markdown("#### AI报告时间")
+    st.caption("AI报告更新到")
+    report_cols = st.columns(2)
+    report_cols[0].metric("中国时间", report_cn)
+    report_cols[1].metric("英国时间", report_uk)
+    st.caption("下次AI报告")
+    next_cols = st.columns(2)
+    next_cols[0].metric("中国时间", next_cn)
+    next_cols[1].metric("英国时间", next_uk)
+    st.metric("最近报告状态", status)
 
 
 def overview_reasons(scores, metrics: dict[str, Any]) -> list[tuple[str, str, str]]:
