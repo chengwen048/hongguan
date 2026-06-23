@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -32,6 +33,8 @@ AI_REFRESH_SECONDS = 12 * 60 * 60
 HISTORY_DAYS = 365 * 5 + 2
 DATA_UPDATE_LOCK = Path("data/update.lock")
 AI_REPORT_LOCK = Path("data/ai_report.lock")
+CN_TZ = ZoneInfo("Asia/Shanghai")
+UK_TZ = ZoneInfo("Europe/London")
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
@@ -319,13 +322,54 @@ def fmt_value(value: float | None, suffix: str = "") -> str:
     return "暂无" if value is None else f"{value:.2f}{suffix}"
 
 
+def parse_local_time(value: Any) -> datetime | None:
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    if isinstance(parsed, pd.Timestamp):
+        dt = parsed.to_pydatetime()
+    else:
+        dt = parsed
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
+
+
+def dual_time_text(value: Any, delta: timedelta | None = None) -> str:
+    dt = parse_local_time(value)
+    if dt is None:
+        return "暂无" if value in (None, "") else str(value)
+    if delta is not None:
+        dt = dt + delta
+    cn = dt.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    uk = dt.astimezone(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"中国 {cn} / 英国 {uk}"
+
+
+def dual_time_short(value: Any) -> str:
+    dt = parse_local_time(value)
+    if dt is None:
+        return "暂无" if value in (None, "") else str(value)
+    cn = dt.astimezone(CN_TZ).strftime("%m-%d %H:%M")
+    uk = dt.astimezone(UK_TZ).strftime("%m-%d %H:%M")
+    return f"中国 {cn} / 英国 {uk}"
+
+
+def with_dual_time_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = out[col].map(dual_time_short)
+    return out
+
+
 def refresh_times(refresh_log: pd.DataFrame) -> tuple[str, str]:
     if refresh_log.empty:
         return "暂无", "等待首次更新"
     latest = pd.to_datetime(refresh_log["created_at"].iloc[0], errors="coerce")
     if pd.isna(latest):
         return str(refresh_log["created_at"].iloc[0]), "约半小时后"
-    return latest.strftime("%Y-%m-%d %H:%M:%S"), (latest + timedelta(seconds=REFRESH_SECONDS)).strftime("%Y-%m-%d %H:%M:%S")
+    return dual_time_text(latest), dual_time_text(latest, timedelta(seconds=REFRESH_SECONDS))
 
 
 def ai_report_times() -> tuple[str, str, str]:
@@ -336,7 +380,7 @@ def ai_report_times() -> tuple[str, str, str]:
     status = str(reports["status"].iloc[0])
     if pd.isna(latest):
         return str(reports["created_at"].iloc[0]), "约12小时后", status
-    return latest.strftime("%Y-%m-%d %H:%M:%S"), (latest + timedelta(hours=12)).strftime("%Y-%m-%d %H:%M:%S"), status
+    return dual_time_text(latest), dual_time_text(latest, timedelta(hours=12)), status
 
 
 def render_update_status(refresh_log: pd.DataFrame):
@@ -588,7 +632,7 @@ def build_pdf_bytes(title: str, report_content: str, scores, metrics: dict[str, 
     draw.text((margin, y), title, font=title_font, fill=ink)
     y += 68
     updated_at, next_at = refresh_times(refresh_log)
-    draw.text((margin, y), f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}    数据更新到：{updated_at}    下次更新：{next_at}", font=small_font, fill=muted)
+    draw.text((margin, y), f"导出时间：{dual_time_text(datetime.now())}    数据更新到：{updated_at}    下次更新：{next_at}", font=small_font, fill=muted)
     y += 54
 
     draw.text((margin, y), "一、总览", font=h_font, fill=accent)
@@ -1104,6 +1148,7 @@ def render_freshness_page(freshness_df: pd.DataFrame):
     }
     filtered["_order"] = filtered["新鲜度状态"].map(status_order).fillna(9)
     filtered = filtered.sort_values(["_order", "分组", "数据集"]).drop(columns=["_order"])
+    filtered = with_dual_time_columns(filtered, ["最近刷新时间"])
     st.dataframe(filtered, width="stretch", hide_index=True, height=620)
 
 
@@ -1432,7 +1477,7 @@ if page == "最终结论":
         meta_cols = st.columns(4)
         meta_cols[0].metric("报告ID", latest_report_id)
         meta_cols[1].metric("报告状态", report.get("status", ""))
-        meta_cols[2].metric("生成时间", report.get("created_at", ""))
+        meta_cols[2].metric("生成时间", dual_time_text(report.get("created_at", "")))
         meta_cols[3].metric("模型", report.get("model", ""))
         if report.get("error"):
             st.warning(report["error"])
@@ -1465,7 +1510,7 @@ if page == "数据源状态":
     st.markdown("### 热点")
     dataframe_preview(news, rows=20, height=360)
     st.markdown("### 增量更新记录")
-    st.dataframe(refresh_log, width="stretch", hide_index=True, height=420)
+    st.dataframe(with_dual_time_columns(refresh_log, ["created_at"]), width="stretch", hide_index=True, height=420)
 
 if page == "数据新鲜度":
     freshness_df = build_freshness_table(macro, tushare_data, market, global_data, mx_data, news, xinwen_lianbo, refresh_log)
@@ -1491,18 +1536,18 @@ if page == "AI分析过程":
         cols[0].metric("分析批次", selected_run)
         cols[1].metric("已完成角色", f"{completed}/{expected_roles}")
         cols[2].metric("失败角色", failed)
-        cols[3].metric("最新更新时间", chunks["created_at"].max() if not chunks.empty else "暂无")
+        cols[3].metric("最新更新时间", dual_time_text(chunks["created_at"].max()) if not chunks.empty else "暂无")
 
         if not chunks.empty:
             st.dataframe(
-                chunks[["id", "created_at", "chunk_name", "status", "prompt_hash", "error"]],
+                with_dual_time_columns(chunks[["id", "created_at", "chunk_name", "status", "prompt_hash", "error"]], ["created_at"]),
                 width="stretch",
                 hide_index=True,
                 height=300,
             )
             st.markdown("### 角色输出")
             for _, row in chunks.iterrows():
-                title = f"#{row['id']} {row['chunk_name']}｜{row['status']}｜{row['created_at']}"
+                title = f"#{row['id']} {row['chunk_name']}｜{row['status']}｜{dual_time_short(row['created_at'])}"
                 with st.expander(title, expanded=row["chunk_name"] in ("首席策略官", "投研质控总监")):
                     if row.get("error"):
                         st.warning(row["error"])
@@ -1514,13 +1559,13 @@ if page == "报告日志":
     if reports.empty:
         st.info("还没有保存过AI报告。系统会每12小时自动生成。")
     else:
-        st.dataframe(reports, width="stretch", hide_index=True, height=320)
+        st.dataframe(with_dual_time_columns(reports, ["created_at"]), width="stretch", hide_index=True, height=320)
         ids = reports["id"].tolist()
         selected = st.selectbox("查看报告", ids, format_func=lambda rid: f"#{rid} - {reports.loc[reports['id'] == rid, 'title'].iloc[0]}")
         report = load_ai_report(int(selected))
         if report:
             st.markdown(f"### {report['title']}")
-            st.caption(f"生成时间：{report['created_at']}｜模型：{report['model']}｜状态：{report['status']}｜Prompt Hash：{report['prompt_hash']}")
+            st.caption(f"生成时间：{dual_time_text(report['created_at'])}｜模型：{report['model']}｜状态：{report['status']}｜Prompt Hash：{report['prompt_hash']}")
             if report.get("error"):
                 st.warning(report["error"])
             st.markdown(report.get("content", ""))

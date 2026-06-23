@@ -7,6 +7,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -27,6 +28,8 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 DB_PATH = Path("data/macro_history.sqlite3")
 OUT_DIR = Path("output/pdf")
+CN_TZ = ZoneInfo("Asia/Shanghai")
+UK_TZ = ZoneInfo("Europe/London")
 ROLE_ORDER = [
     "政策研究员",
     "宏观经济学家",
@@ -193,6 +196,18 @@ def fetch_one(conn: sqlite3.Connection, query: str, params: tuple = ()) -> sqlit
 def fetch_all(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[sqlite3.Row]:
     conn.row_factory = sqlite3.Row
     return conn.execute(query, params).fetchall()
+
+
+def dual_time_text(value) -> str:
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return "暂无" if value in (None, "") else str(value)
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    cn = dt.astimezone(CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    uk = dt.astimezone(UK_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    return f"中国 {cn} / 英国 {uk}"
 
 
 def latest_dataset_meta(conn: sqlite3.Connection, dataset: str) -> dict:
@@ -371,8 +386,8 @@ def build_pdf(report_id: int, output: Path | None = None) -> Path:
     story = []
     story.append(Paragraph("A股宏观环境分析完整PDF", styles["title"]))
     story.append(Paragraph(f"报告ID：{report['id']}｜分析批次：{run_id}", styles["body"]))
-    story.append(Paragraph(f"生成时间：{report['created_at']}｜模型：{report['model']}｜状态：{report['status']}", styles["body"]))
-    story.append(Paragraph(f"导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["body"]))
+    story.append(Paragraph(f"生成时间：{dual_time_text(report['created_at'])}｜模型：{report['model']}｜状态：{report['status']}", styles["body"]))
+    story.append(Paragraph(f"导出时间：{dual_time_text(datetime.now())}", styles["body"]))
     story.append(Spacer(1, 10))
 
     story.append(Paragraph("一、总览", styles["h1"]))
@@ -392,7 +407,7 @@ def build_pdf(report_id: int, output: Path | None = None) -> Path:
         ["报告标题", report["title"]],
         ["数据覆盖", f"{available_sets} 个有效数据集 / 传入总行数 {total_rows}"],
         ["角色输出", f"{len(chunks)} 个分块输出，其中本PDF采用 {len([x for x in ROLE_ORDER if x in chunk_by_name])} 个分析/汇总角色"],
-        ["最近数据刷新", latest_refresh[0]["created_at"] if latest_refresh else "暂无"],
+        ["最近数据刷新", dual_time_text(latest_refresh[0]["created_at"]) if latest_refresh else "暂无"],
     ]
     story.append(make_table(meta_table, styles, [36 * mm, A4[0] - 66 * mm]))
     story.append(Spacer(1, 8))
@@ -417,7 +432,7 @@ def build_pdf(report_id: int, output: Path | None = None) -> Path:
         row = chunk_by_name.get(role)
         if not row:
             continue
-        story.append(Paragraph(f"{role}｜{row['status']}｜{row['created_at']}", styles["h2"]))
+        story.append(Paragraph(f"{role}｜{row['status']}｜{dual_time_text(row['created_at'])}", styles["h2"]))
         for block in markdown_blocks(row["content"] or "", styles):
             story.append(block)
         story.append(Spacer(1, 8))
