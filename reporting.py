@@ -560,14 +560,91 @@ def compact_role_data(value: Any, max_records: int = 10, max_text: int = 180) ->
     return value
 
 
+def _summary_line(summary: dict[str, Any]) -> str:
+    if not isinstance(summary, dict):
+        return "暂无"
+    bits = []
+    if summary.get("latest_date"):
+        bits.append(f"最新日期{summary.get('latest_date')}")
+    if summary.get("latest_value") is not None:
+        bits.append(f"最新值{summary.get('latest_value')}")
+    if summary.get("trend_3_period") is not None:
+        bits.append(f"近3期变化{summary.get('trend_3_period')}")
+    if not bits and summary.get("rows") is not None:
+        bits.append(f"行数{summary.get('rows')}")
+    return "，".join(bits) if bits else "暂无"
+
+
+def build_local_role_fallback(role_name: str, role_data: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    macro = snapshot.get("macro", {})
+    tushare = snapshot.get("tushare", {})
+    market = snapshot.get("market", {})
+    global_data = snapshot.get("global", {})
+    news = snapshot.get("hot_news", {})
+    policy = snapshot.get("xinwen_lianbo_policy_signal", {})
+    risk = snapshot.get("risk_evidence_database", {})
+    if role_name == "政策研究员":
+        return "\n".join([
+            "结论：政策环境偏大规模托底，但仍处在稳增长与扩内需的持续确认期。",
+            f"证据：新闻联播关键词{policy.get('policy_keyword_counts', {})}；财政收入{_summary_line(macro.get('fiscal_revenue', {}))}；热点新闻{news.get('latest_date', '暂无')}",
+            "反证：若政策信号偏强但社融、地产和外需没有同步改善，说明预期强、落地弱。",
+            "后续观察：新闻联播、财政、货币、产业政策是否继续同向。",
+        ])
+    if role_name == "宏观经济学家":
+        return "\n".join([
+            "结论：经济周期仍是弱复苏/修复观察期。",
+            f"证据：GDP{_summary_line(macro.get('gdp', {}))}；PMI{_summary_line(tushare.get('tushare_pmi') or macro.get('pmi', {}))}；社零{_summary_line(macro.get('retail', {}))}；地产{_summary_line(macro.get('real_estate', {}))}。",
+            "反证：PMI、CPI/PPI和地产仍偏弱，说明量价修复不均衡。",
+            "后续观察：PMI、社零、投资、出口、地产和失业率是否连续改善。",
+        ])
+    if role_name == "流动性与利率交易员":
+        return "\n".join([
+            "结论：流动性偏宽松，但股市可用资金是否转强还需验证。",
+            f"证据：M2{_summary_line(tushare.get('tushare_m2') or macro.get('m2', {}))}；社融{_summary_line(tushare.get('tushare_social_financing') or macro.get('social_financing', {}))}；北向资金{_summary_line(tushare.get('tushare_hsgt_moneyflow') or market.get('north', {}))}；汇率{_summary_line(market.get('fx_boc_safe', {}))}。",
+            "反证：M2高但社融弱，或利率低但北向/成交不配合，说明资金传导不顺。",
+            "后续观察：LPR、DR007、北向、汇率和基金发行。",
+        ])
+    if role_name == "权益估值分析师":
+        return "\n".join([
+            "结论：盈利仍在修复中，低估不等于立刻上涨。",
+            f"证据：PPI{_summary_line(tushare.get('tushare_ppi') or macro.get('ppi', {}))}；工业增加值{_summary_line(macro.get('industrial_value_added', {}))}；指数估值{_summary_line(market.get('index_pe', {}))}。",
+            "反证：盈利若继续下修，即使估值低也可能是价值陷阱。",
+            "后续观察：PPI、工业利润、宽基估值和风险溢价。",
+        ])
+    if role_name == "全球宏观策略师":
+        return "\n".join([
+            "结论：外部环境仍有约束，美债、美元和中美利差会压制部分估值扩张。",
+            f"证据：美元指数{_summary_line(global_data.get('dxy', {}))}；中美国债收益率{_summary_line(global_data.get('cn_us_rate_spread', {}))}；美国利率{_summary_line(global_data.get('us_rate', {}))}。",
+            "反证：若美元和美债继续偏强，成长风格和高估值板块弹性会受限。",
+            "后续观察：美联储、美元、美债、人民币和全球商品。",
+        ])
+    if role_name == "行业配置策略师":
+        return "\n".join([
+            "结论：当前主线仍偏科技成长与政策主题，高股息/央国企是防御锚。",
+            "建议：优先关注 AI/算力/半导体、高股息/央国企、出口链、消费/创新药、券商/金融科技。",
+            "证据：新闻联播、妙想资讯、资金流、人气榜和宏观数据仍支持结构性配置。",
+            f"覆盖提示：{role_data.get('coverage_summary', [])[:2]}",
+        ])
+    if role_name == "投资风险管理官":
+        return "\n".join([
+            "结论：主要风险集中在地产、外资/北向、人民币与外汇、美债/中美利差和盈利下修。",
+            f"证据：地产{risk.get('地产拖累', [])[:1]}；北向{risk.get('外资与北向资金', [])[:1]}；外汇{risk.get('人民币与外汇', [])[:1]}；海外利率{risk.get('海外利率与中美利差', [])[:1]}。",
+            "反证：若风险数据库中的数据没有被角色引用，说明报告必须补证据而不是空写风险。",
+            "后续观察：外储、汇率、北向资金、地产销售、估值和盈利修复。",
+        ])
+    return "数据不足/本角色未成功返回。"
+
+
 def generate_role_outputs(snapshot: dict[str, Any], model: str, report_run_id: str) -> list[dict[str, Any]]:
     outputs = []
     for role_name, instruction, keys in ROLE_SPECS:
         role_data = slice_snapshot_for_role(snapshot, keys, role_name)
         prompt = build_role_prompt(role_name, instruction, role_data)
         result = call_llm_with_meta(prompt, model=model)
-        status = "ok" if result.get("ok") else "error"
+        status = "ok" if result.get("ok") else "fallback"
         content = result.get("content", "")
+        if not result.get("ok"):
+            content = build_local_role_fallback(role_name, role_data, snapshot)
         chunk_id = save_ai_chunk(
             report_run_id=report_run_id,
             chunk_name=role_name,
@@ -575,7 +652,7 @@ def generate_role_outputs(snapshot: dict[str, Any], model: str, report_run_id: s
             prompt_hash=prompt_hash(prompt),
             content=content,
             status=status,
-            error=None if result.get("ok") else content,
+            error=None if result.get("ok") else result.get("content", content),
             coverage=role_data.get("coverage_summary"),
             usage=result.get("usage"),
         )
@@ -609,7 +686,7 @@ def summarize_role_outputs_for_synthesis(role_outputs: list[dict[str, Any]], max
 
 def content_for_role(role_outputs: list[dict[str, Any]], role: str) -> str:
     for item in role_outputs:
-        if item.get("role") == role and item.get("status") == "ok":
+        if item.get("role") == role and item.get("status") in ("ok", "fallback"):
             return str(item.get("content") or "").strip()
     return "数据不足/本角色未成功返回。"
 

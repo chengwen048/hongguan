@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -232,7 +233,12 @@ def call_llm_with_meta(prompt: str, api_key: str | None = None, base_url: str | 
         timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "300"))
         response = requests.post(
             f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "macro-dashboard/1.0",
+            },
             json={
                 "model": model,
                 "temperature": 0.25,
@@ -253,15 +259,26 @@ def call_llm_with_meta(prompt: str, api_key: str | None = None, base_url: str | 
             "finished_at": datetime.now().isoformat(timespec="seconds"),
         }
     if response.status_code >= 400:
+        error_text = clean_llm_error(response.text)
         return {
             "ok": False,
-            "content": f"LLM接口返回 {response.status_code}: {response.text[:1000]}",
+            "content": f"LLM接口返回 {response.status_code}: {error_text}",
             "model": model,
             "base_url": base_url,
             "started_at": started_at,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
         }
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "content": f"LLM接口未返回JSON: {clean_llm_error(response.text)}",
+            "model": model,
+            "base_url": base_url,
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        }
     if "error" in data:
         return {
             "ok": False,
@@ -286,3 +303,17 @@ def call_llm_with_meta(prompt: str, api_key: str | None = None, base_url: str | 
 
 def call_llm(prompt: str, api_key: str | None = None, base_url: str | None = None, model: str | None = None) -> str:
     return call_llm_with_meta(prompt, api_key=api_key, base_url=base_url, model=model)["content"]
+
+
+def clean_llm_error(text: str, limit: int = 360) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "空响应"
+    if "Attention Required" in raw and "Cloudflare" in raw:
+        return "Cloudflare 拦截了服务器请求。通常是当前云服务器 IP 被接口站点风控，需要更换接口出口、让服务商放行服务器 IP，或改用不会拦截服务器请求的 OpenAI 兼容接口。"
+    if "<html" in raw.lower() or "<!doctype" in raw.lower():
+        title = re.search(r"<title>(.*?)</title>", raw, flags=re.I | re.S)
+        if title:
+            return re.sub(r"\s+", " ", title.group(1)).strip()
+        return "接口返回HTML页面，不是JSON API响应。请检查 OPENAI_BASE_URL 是否为 /v1 API 地址，或接口站点是否拦截服务器请求。"
+    return raw[:limit]
