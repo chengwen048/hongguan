@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any
 
@@ -229,75 +230,89 @@ def call_llm_with_meta(prompt: str, api_key: str | None = None, base_url: str | 
     started_at = datetime.now().isoformat(timespec="seconds")
     import requests
 
-    try:
-        timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "300"))
-        response = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "macro-dashboard/1.0",
-            },
-            json={
-                "model": model,
-                "temperature": 0.25,
-                "messages": [
-                    {"role": "system", "content": "你是严谨的中文A股宏观策略分析师，只基于给定数据做推理。"},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-            timeout=timeout_seconds,
-        )
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "content": f"LLM接口请求失败：{exc}",
-            "model": model,
-            "base_url": base_url,
-            "started_at": started_at,
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-        }
-    if response.status_code >= 400:
-        error_text = clean_llm_error(response.text)
-        return {
-            "ok": False,
-            "content": f"LLM接口返回 {response.status_code}: {error_text}",
-            "model": model,
-            "base_url": base_url,
-            "started_at": started_at,
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-        }
-    try:
-        data = response.json()
-    except ValueError:
-        return {
-            "ok": False,
-            "content": f"LLM接口未返回JSON: {clean_llm_error(response.text)}",
-            "model": model,
-            "base_url": base_url,
-            "started_at": started_at,
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-        }
-    if "error" in data:
-        return {
-            "ok": False,
-            "content": str(data["error"]),
-            "model": model,
-            "base_url": base_url,
-            "started_at": started_at,
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-        }
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    return {
-        "ok": True,
-        "content": content,
+    timeout_seconds = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "300"))
+    retry_attempts = max(1, int(os.getenv("OPENAI_RETRY_ATTEMPTS", "4")))
+    retry_seconds = float(os.getenv("OPENAI_RETRY_SECONDS", "8"))
+    min_interval = float(os.getenv("OPENAI_MIN_INTERVAL_SECONDS", "2.5"))
+    base_urls = llm_base_urls(base_url)
+    payload = {
         "model": model,
-        "base_url": base_url,
+        "temperature": 0.25,
+        "messages": [
+            {"role": "system", "content": "你是严谨的中文A股宏观策略分析师，只基于给定数据做推理。"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 AppleWebKit/537.36 macro-dashboard/1.0",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+    last_error = ""
+    for candidate_base in base_urls:
+        endpoint = f"{candidate_base}/chat/completions"
+        for attempt in range(1, retry_attempts + 1):
+            if min_interval > 0:
+                time.sleep(min_interval)
+            session = requests.Session()
+            if os.getenv("OPENAI_DISABLE_PROXY", "1").lower() not in ("0", "false", "no"):
+                session.trust_env = False
+            try:
+                response = session.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
+            except requests.RequestException as exc:
+                last_error = f"LLM接口请求失败：{exc}"
+                if attempt < retry_attempts:
+                    time.sleep(retry_seconds * attempt)
+                    continue
+                break
+            if response.status_code >= 400:
+                last_error = f"LLM接口返回 {response.status_code}: {clean_llm_error(response.text)}"
+                if response.status_code in (403, 408, 429, 500, 502, 503, 504) and attempt < retry_attempts:
+                    time.sleep(retry_seconds * attempt)
+                    continue
+                break
+            try:
+                data = response.json()
+            except ValueError:
+                last_error = f"LLM接口未返回JSON: {clean_llm_error(response.text)}"
+                if attempt < retry_attempts:
+                    time.sleep(retry_seconds * attempt)
+                    continue
+                break
+            if "error" in data:
+                last_error = str(data["error"])
+                if attempt < retry_attempts:
+                    time.sleep(retry_seconds * attempt)
+                    continue
+                break
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content.strip():
+                last_error = "LLM接口返回空内容"
+                if attempt < retry_attempts:
+                    time.sleep(retry_seconds * attempt)
+                    continue
+                break
+            return {
+                "ok": True,
+                "content": content,
+                "model": model,
+                "base_url": candidate_base,
+                "started_at": started_at,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "response_id": data.get("id", ""),
+                "usage": data.get("usage", {}),
+                "attempts": attempt,
+            }
+    return {
+        "ok": False,
+        "content": last_error or "LLM接口请求失败：未知错误",
+        "model": model,
+        "base_url": ",".join(base_urls),
         "started_at": started_at,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
-        "response_id": data.get("id", ""),
-        "usage": data.get("usage", {}),
     }
 
 
@@ -317,3 +332,24 @@ def clean_llm_error(text: str, limit: int = 360) -> str:
             return re.sub(r"\s+", " ", title.group(1)).strip()
         return "接口返回HTML页面，不是JSON API响应。请检查 OPENAI_BASE_URL 是否为 /v1 API 地址，或接口站点是否拦截服务器请求。"
     return raw[:limit]
+
+
+def llm_base_urls(primary: str) -> list[str]:
+    values = [primary]
+    extra = os.getenv("OPENAI_BASE_URLS", "")
+    if extra:
+        values.extend(part.strip() for part in extra.split(",") if part.strip())
+    out = []
+    for value in values:
+        cleaned = value.rstrip("/")
+        if not cleaned:
+            continue
+        if cleaned.endswith("/chat/completions"):
+            cleaned = cleaned[: -len("/chat/completions")]
+        candidates = [cleaned]
+        if not cleaned.endswith("/v1"):
+            candidates.insert(0, f"{cleaned}/v1")
+        for candidate in candidates:
+            if candidate not in out:
+                out.append(candidate)
+    return out

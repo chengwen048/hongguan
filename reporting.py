@@ -641,10 +641,8 @@ def generate_role_outputs(snapshot: dict[str, Any], model: str, report_run_id: s
         role_data = slice_snapshot_for_role(snapshot, keys, role_name)
         prompt = build_role_prompt(role_name, instruction, role_data)
         result = call_llm_with_meta(prompt, model=model)
-        status = "ok" if result.get("ok") else "fallback"
+        status = "ok" if result.get("ok") else "error"
         content = result.get("content", "")
-        if not result.get("ok"):
-            content = build_local_role_fallback(role_name, role_data, snapshot)
         chunk_id = save_ai_chunk(
             report_run_id=report_run_id,
             chunk_name=role_name,
@@ -686,9 +684,38 @@ def summarize_role_outputs_for_synthesis(role_outputs: list[dict[str, Any]], max
 
 def content_for_role(role_outputs: list[dict[str, Any]], role: str) -> str:
     for item in role_outputs:
-        if item.get("role") == role and item.get("status") in ("ok", "fallback"):
+        if item.get("role") == role and item.get("status") == "ok":
             return str(item.get("content") or "").strip()
     return "数据不足/本角色未成功返回。"
+
+
+def llm_failure_report(role_outputs: list[dict[str, Any]], stage: str) -> str:
+    failed = [
+        {
+            "role": item.get("role"),
+            "status": item.get("status"),
+            "error": str(item.get("content") or "")[:260],
+        }
+        for item in role_outputs
+        if item.get("status") != "ok"
+    ]
+    lines = [
+        "ChatGPT 未成功完成分析，本次不生成正式宏观结论。",
+        "",
+        f"失败阶段：{stage}",
+        "",
+        "原因：至少一个 ChatGPT 分析角色或最终汇总角色没有返回成功响应。根据你的要求，系统不会使用本地规则兜底冒充 ChatGPT 分析结果。",
+        "",
+        "需要处理：",
+        "1. 检查 OPENAI_BASE_URL 是否为可用的 /v1 API 地址。",
+        "2. 如果服务器返回 Cloudflare 403，说明当前云服务器 IP 被接口站点拦截，需要更换接口出口、让接口服务商放行服务器 IP，或改用不会拦截服务器请求的 OpenAI 兼容接口。",
+        "3. 处理后重新点击“手动触发一次AI分析”。报告状态必须为 ok，才代表 ChatGPT 真实分析成功。",
+        "",
+        "失败明细：",
+    ]
+    for item in failed[:12]:
+        lines.append(f"- {item['role']}：{item['status']}；{item['error']}")
+    return "\n".join(lines)
 
 
 def build_local_fallback_report(role_outputs: list[dict[str, Any]], synthesis_content: str = "") -> str:
@@ -763,6 +790,28 @@ def generate_ai_report(title: str = "A股宏观环境自动报告") -> dict:
     report_run_id = datetime_now_id()
     model = os.getenv("OPENAI_MODEL", "gpt-5.5")
     role_outputs = generate_role_outputs(snapshot, model=model, report_run_id=report_run_id)
+    failed_roles = [item for item in role_outputs if item.get("status") != "ok"]
+    if failed_roles:
+        content = llm_failure_report(role_outputs, "职业角色分块分析")
+        rid = save_ai_report(
+            title=title,
+            model=model,
+            prompt_hash=prompt_hash(content),
+            content=content,
+            status="error",
+            error=content,
+            coverage=snapshot.get("coverage"),
+            usage={},
+        )
+        return {
+            "ok": False,
+            "content": content,
+            "report_id": rid,
+            "role_outputs": role_outputs,
+            "report_run_id": report_run_id,
+            "model": model,
+            "model_base_url": os.getenv("OPENAI_BASE_URL", ""),
+        }
     synthesis_inputs = summarize_role_outputs_for_synthesis(role_outputs, max_chars=550)
     synthesis_prompt = build_synthesis_prompt(synthesis_inputs, snapshot.get("coverage", [])[:25])
     synthesis_result = call_llm_with_meta(synthesis_prompt, model=model)
@@ -788,16 +837,33 @@ def generate_ai_report(title: str = "A股宏观环境自动报告") -> dict:
             "usage": synthesis_result.get("usage", {}),
         }
     )
+    if not synthesis_result.get("ok"):
+        content = llm_failure_report(role_outputs, "首席策略官汇总")
+        rid = save_ai_report(
+            title=title,
+            model=model,
+            prompt_hash=prompt_hash(synthesis_prompt),
+            content=content,
+            status="error",
+            error=content,
+            coverage=snapshot.get("coverage"),
+            usage=synthesis_result.get("usage"),
+        )
+        synthesis_result["report_id"] = rid
+        synthesis_result["role_outputs"] = role_outputs
+        synthesis_result["report_run_id"] = report_run_id
+        synthesis_result["model_base_url"] = os.getenv("OPENAI_BASE_URL", "")
+        return synthesis_result
 
     review_inputs = summarize_role_outputs_for_synthesis(role_outputs, max_chars=450)
-    review_draft = synthesis_content if synthesis_result.get("ok") else build_local_fallback_report(role_outputs, synthesis_content)
+    review_draft = synthesis_content
     prompt = build_quality_review_prompt(review_draft[:6000], review_inputs, snapshot.get("coverage", [])[:25])
     result = call_llm_with_meta(prompt, model=model)
     status = "ok" if result.get("ok") else "error"
     content = result.get("content", "")
     if not result.get("ok"):
-        content = build_local_fallback_report(role_outputs, synthesis_content)
-        status = "fallback"
+        content = llm_failure_report(role_outputs, "投研质控总监最终输出")
+        status = "error"
     review_chunk_id = save_ai_chunk(
         report_run_id=report_run_id,
         chunk_name="投研质控总监",
