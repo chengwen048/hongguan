@@ -11,6 +11,46 @@ import pandas as pd
 
 DB_PATH = Path("data/macro_history.sqlite3")
 
+DATE_CANDIDATES = (
+    "date",
+    "日期",
+    "月份",
+    "时间",
+    "trade_date",
+    "ann_date",
+    "end_date",
+    "quarter",
+    "季度",
+    "报告期",
+    "抓取日期",
+    "created_at",
+    "observed_at",
+    "updated_at",
+)
+
+VALUE_CANDIDATES = (
+    "value",
+    "今值",
+    "最新值",
+    "现值",
+    "累计-同比增长",
+    "累计增长",
+    "同比增长",
+    "国内生产总值-同比增长",
+    "PMI",
+    "nt_yoy",
+    "ppi_yoy",
+    "m2_yoy",
+    "inc_month",
+    "stk_end",
+    "north_money",
+    "收盘",
+    "最新价",
+    "涨跌幅",
+    "市盈率",
+    "市净率",
+)
+
 
 def _json_default(value):
     if isinstance(value, pd.Timestamp):
@@ -111,6 +151,51 @@ def _records(df: pd.DataFrame) -> Iterable[tuple[str, str]]:
         yield _row_key(record), json.dumps(record, ensure_ascii=False, sort_keys=True, default=_json_default)
 
 
+def _parse_mixed_dates(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.strip()
+    normalized = (
+        text.str.replace("Q1", "-03-01", regex=False)
+        .str.replace("Q2", "-06-01", regex=False)
+        .str.replace("Q3", "-09-01", regex=False)
+        .str.replace("Q4", "-12-01", regex=False)
+    )
+    zh_month = normalized.str.extract(r"(?P<year>\d{4})年(?P<month>\d{1,2})月")
+    has_zh_month = zh_month["year"].notna()
+    normalized.loc[has_zh_month] = zh_month.loc[has_zh_month, "year"] + "-" + zh_month.loc[has_zh_month, "month"].str.zfill(2) + "-01"
+    mask8 = normalized.str.fullmatch(r"\d{8}")
+    normalized.loc[mask8] = normalized.loc[mask8].str[:4] + "-" + normalized.loc[mask8].str[4:6] + "-" + normalized.loc[mask8].str[6:8]
+    mask6 = normalized.str.fullmatch(r"\d{6}")
+    normalized.loc[mask6] = normalized.loc[mask6].str[:4] + "-" + normalized.loc[mask6].str[4:6] + "-01"
+    return pd.to_datetime(normalized, errors="coerce")
+
+
+def _enhance_loaded_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    lower_cols = {str(col).lower(): col for col in out.columns}
+    date_col = next((col for col in DATE_CANDIDATES if col in out.columns), None)
+    if date_col is None:
+        date_col = next((lower_cols[col.lower()] for col in DATE_CANDIDATES if col.lower() in lower_cols), None)
+    if date_col:
+        parsed = _parse_mixed_dates(out[date_col])
+        if parsed.notna().sum():
+            if "date" in out.columns:
+                out["date"] = parsed
+            else:
+                out.insert(0, "date", parsed)
+    if "value" not in out.columns:
+        value_col = next((col for col in VALUE_CANDIDATES if col in out.columns and col != "value"), None)
+        if value_col is None:
+            numeric_cols = [col for col in out.columns if col != "date" and pd.to_numeric(out[col], errors="coerce").notna().sum() > 0]
+            value_col = numeric_cols[0] if numeric_cols else None
+        if value_col:
+            value = pd.to_numeric(out[value_col], errors="coerce")
+            if value.notna().sum():
+                out["value"] = value
+    return out
+
+
 def save_result(group_name: str, dataset: str, result) -> dict[str, int]:
     now = datetime.now().isoformat(timespec="seconds")
     rows_seen = 0 if result is None or result.data.empty else len(result.data)
@@ -171,7 +256,7 @@ def load_dataset(dataset: str, limit: int = 5000) -> pd.DataFrame:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT payload_json
+            SELECT payload_json, observed_at, updated_at
             FROM observations
             WHERE dataset = ?
             ORDER BY row_key DESC
@@ -181,10 +266,18 @@ def load_dataset(dataset: str, limit: int = 5000) -> pd.DataFrame:
         ).fetchall()
     if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame([json.loads(row[0]) for row in rows])
-    for col in ("date", "日期", "trade_date", "ann_date", "end_date", "quarter", "报告期", "抓取日期"):
-        if col in df.columns:
-            parsed = pd.to_datetime(df[col].astype(str), errors="coerce")
+    records = []
+    for payload_json, observed_at, updated_at in rows:
+        record = json.loads(payload_json)
+        record.setdefault("observed_at", observed_at)
+        record.setdefault("updated_at", updated_at)
+        records.append(record)
+    df = _enhance_loaded_dataset(pd.DataFrame(records))
+    lower_cols = {str(col).lower(): col for col in df.columns}
+    for candidate in DATE_CANDIDATES:
+        col = candidate if candidate in df.columns else lower_cols.get(candidate.lower())
+        if col:
+            parsed = _parse_mixed_dates(df[col])
             if parsed.notna().sum():
                 return df.assign(_sort_date=parsed).sort_values("_sort_date").drop(columns=["_sort_date"])
     return df
@@ -195,10 +288,12 @@ def load_dataset_recent(dataset: str, days: int = 370, limit: int = 5000) -> pd.
     if df.empty:
         return df
     cutoff = pd.Timestamp(datetime.now() - timedelta(days=days))
-    for col in ("date", "日期", "trade_date", "ann_date", "end_date", "quarter", "报告期", "抓取日期"):
-        if col not in df.columns:
+    lower_cols = {str(col).lower(): col for col in df.columns}
+    for candidate in DATE_CANDIDATES:
+        col = candidate if candidate in df.columns else lower_cols.get(candidate.lower())
+        if not col:
             continue
-        parsed = pd.to_datetime(df[col].astype(str), errors="coerce")
+        parsed = _parse_mixed_dates(df[col])
         if parsed.notna().sum() == 0:
             continue
         recent = df.loc[parsed >= cutoff].copy()

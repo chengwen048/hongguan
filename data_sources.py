@@ -33,6 +33,44 @@ class DataResult:
     error: str | None = None
 
 
+DATE_CANDIDATES = (
+    "date",
+    "日期",
+    "月份",
+    "时间",
+    "trade_date",
+    "ann_date",
+    "end_date",
+    "quarter",
+    "季度",
+    "报告期",
+    "抓取日期",
+)
+
+PREFERRED_VALUE_CANDIDATES = (
+    "value",
+    "今值",
+    "最新值",
+    "现值",
+    "累计-同比增长",
+    "累计增长",
+    "同比增长",
+    "国内生产总值-同比增长",
+    "PMI",
+    "nt_yoy",
+    "ppi_yoy",
+    "m2_yoy",
+    "inc_month",
+    "stk_end",
+    "north_money",
+    "收盘",
+    "最新价",
+    "涨跌幅",
+    "市盈率",
+    "市净率",
+)
+
+
 def disable_proxy_if_needed() -> None:
     if os.getenv("TUSHARE_DISABLE_PROXY", "1").lower() not in ("0", "false", "no"):
         for key in PROXY_ENV_KEYS:
@@ -79,7 +117,8 @@ def safe_result(name: str, source: str, fn: Callable[[], pd.DataFrame]) -> DataR
         patch_requests_timeout()
         with execution_timeout(SOURCE_EXEC_TIMEOUT_SECONDS):
             df = fn()
-        return DataResult(name, source, df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+        df = enhance_dataframe(df if isinstance(df, pd.DataFrame) else pd.DataFrame())
+        return DataResult(name, source, df)
     except Exception as exc:
         return DataResult(name, source, pd.DataFrame(), str(exc))
 
@@ -103,6 +142,59 @@ def normalize_date_value(df: pd.DataFrame, date_col: str, value_col: str) -> pd.
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out["value"] = pd.to_numeric(out["value"], errors="coerce")
     return out.dropna(subset=["date", "value"]).sort_values("date")
+
+
+def parse_mixed_date_series(series: pd.Series) -> pd.Series:
+    text = series.astype(str).str.strip()
+    normalized = (
+        text.str.replace("Q1", "-03-01", regex=False)
+        .str.replace("Q2", "-06-01", regex=False)
+        .str.replace("Q3", "-09-01", regex=False)
+        .str.replace("Q4", "-12-01", regex=False)
+    )
+    mask8 = normalized.str.fullmatch(r"\d{8}")
+    normalized.loc[mask8] = normalized.loc[mask8].str[:4] + "-" + normalized.loc[mask8].str[4:6] + "-" + normalized.loc[mask8].str[6:8]
+    mask6 = normalized.str.fullmatch(r"\d{6}")
+    normalized.loc[mask6] = normalized.loc[mask6].str[:4] + "-" + normalized.loc[mask6].str[4:6] + "-01"
+    zh_month = normalized.str.extract(r"(?P<year>\d{4})年(?P<month>\d{1,2})月")
+    has_zh_month = zh_month["year"].notna()
+    normalized.loc[has_zh_month] = zh_month.loc[has_zh_month, "year"] + "-" + zh_month.loc[has_zh_month, "month"].str.zfill(2) + "-01"
+    return pd.to_datetime(normalized, errors="coerce")
+
+
+def enhance_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Preserve source columns while adding common date/value fields for charts, freshness and AI."""
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    out = df.copy()
+    lower_cols = {str(col).lower(): col for col in out.columns}
+    date_col = next((col for col in DATE_CANDIDATES if col in out.columns), None)
+    if date_col is None:
+        date_col = next((lower_cols[col.lower()] for col in DATE_CANDIDATES if col.lower() in lower_cols), None)
+    if "date" not in out.columns and date_col:
+        parsed = parse_mixed_date_series(out[date_col])
+        if parsed.notna().sum():
+            out.insert(0, "date", parsed)
+    elif "date" in out.columns:
+        parsed = parse_mixed_date_series(out["date"])
+        if parsed.notna().sum():
+            out["date"] = parsed
+    if "value" not in out.columns:
+        value_col = next((col for col in PREFERRED_VALUE_CANDIDATES if col in out.columns and col != "value"), None)
+        if value_col is None:
+            numeric_cols = [col for col in out.columns if pd.to_numeric(out[col], errors="coerce").notna().sum() > 0 and col != "date"]
+            value_col = numeric_cols[0] if numeric_cols else None
+        if value_col is not None:
+            value = pd.to_numeric(out[value_col], errors="coerce")
+            if value.notna().sum():
+                out["value"] = value
+    if not any(col in out.columns for col in DATE_CANDIDATES):
+        today = datetime.now().strftime("%Y-%m-%d")
+        out.insert(0, "抓取日期", today)
+        out.insert(0, "date", pd.Timestamp(today))
+    if "date" in out.columns:
+        out = out.sort_values("date", kind="stable")
+    return out
 
 
 def china_month_to_date(value: str) -> pd.Timestamp | pd.NaT:

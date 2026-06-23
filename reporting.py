@@ -17,6 +17,34 @@ load_dotenv(".env")
 
 HISTORY_DAYS = 365 * 5 + 2
 
+FREQUENCY_RULES = {
+    "daily": 10,
+    "weekly": 21,
+    "monthly": 75,
+    "quarterly": 150,
+    "event": 365,
+    "snapshot": 30,
+}
+
+DATASET_FREQUENCY = {
+    "gdp": "quarterly", "tushare_gdp": "quarterly", "us_gdp": "quarterly",
+    "pmi": "monthly", "cpi": "monthly", "ppi": "monthly", "retail": "monthly",
+    "investment": "monthly", "exports": "monthly", "imports": "monthly", "m2": "monthly",
+    "social_financing": "monthly", "tushare_cpi": "monthly", "tushare_ppi": "monthly",
+    "tushare_m2": "monthly", "tushare_social_financing": "monthly", "tushare_pmi": "monthly",
+    "real_estate": "monthly", "unemployment": "monthly", "fx_reserves": "monthly",
+    "new_house_price": "monthly", "fiscal_revenue": "monthly", "industrial_value_added": "monthly",
+    "us_cpi": "monthly", "us_core_cpi": "monthly", "us_nonfarm": "monthly",
+    "us_unemployment": "monthly", "us_retail": "monthly", "us_ism_pmi": "monthly",
+    "us_trade": "monthly", "lpr": "daily", "dr007": "daily", "tushare_hsgt_moneyflow": "daily",
+    "north": "daily", "index_spot": "snapshot", "a_spot": "snapshot", "hot_rank": "snapshot",
+    "hot_up": "snapshot", "fund_flow": "daily", "index_pe": "daily", "csindex_valuation": "daily",
+    "fx": "snapshot", "fx_boc_safe": "daily", "dxy": "snapshot", "commodity": "snapshot",
+    "us_rate": "event", "cn_us_rate_spread": "daily", "commodity_price": "weekly",
+    "au_report": "event", "news": "daily", "xinwen_lianbo": "daily", "mx_search": "daily",
+    "mx_finance": "daily",
+}
+
 
 DATASETS = {
     "macro": {
@@ -81,6 +109,60 @@ DATASETS = {
 
 def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16]
+
+
+def _latest_ts(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+    for col in ("date", "日期", "trade_date", "TRADE_DATE", "ann_date", "end_date", "quarter", "报告期", "抓取日期", "observed_at", "updated_at"):
+        if col not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[col].astype(str), errors="coerce")
+        if parsed.notna().sum():
+            return parsed.max().strftime("%Y-%m-%d")
+    return ""
+
+
+def data_freshness_for_ai(groups: dict[str, dict[str, DataResult]], refresh_log: pd.DataFrame) -> list[dict[str, Any]]:
+    rows = []
+    today = pd.Timestamp.now().normalize()
+    latest_errors = {}
+    if not refresh_log.empty and {"dataset", "status", "error", "created_at"}.issubset(refresh_log.columns):
+        for _, row in refresh_log.iterrows():
+            latest_errors.setdefault(row["dataset"], row.to_dict())
+    for group_name, group in groups.items():
+        for dataset, result in group.items():
+            latest = _latest_ts(result.data)
+            lag_days = None
+            if latest:
+                lag_days = int((today - pd.to_datetime(latest)).days)
+            freq = DATASET_FREQUENCY.get(dataset, "monthly")
+            max_lag = FREQUENCY_RULES.get(freq, 75)
+            row = latest_errors.get(dataset, {})
+            status = "正常"
+            if result.data.empty:
+                status = "无数据"
+            elif lag_days is None and freq != "snapshot":
+                status = "无日期字段"
+            elif lag_days is not None and lag_days > max_lag * 2:
+                status = "明显滞后"
+            elif lag_days is not None and lag_days > max_lag:
+                status = "偏旧"
+            if str(row.get("status", "")) == "error" and not result.data.empty:
+                status = "使用历史缓存/源异常"
+            rows.append(
+                {
+                    "group": group_name,
+                    "dataset": dataset,
+                    "name": result.name,
+                    "latest_date": latest or "无日期字段",
+                    "lag_days": lag_days,
+                    "freshness_status": status,
+                    "latest_refresh_status": row.get("status", ""),
+                    "latest_error": str(row.get("error") or "")[:160],
+                }
+            )
+    return rows
 
 
 def load_local_bundle():
@@ -340,6 +422,14 @@ def build_ai_snapshot(bundle, scores):
     important_tushare = ["tushare_gdp", "tushare_cpi", "tushare_ppi", "tushare_m2", "tushare_social_financing", "tushare_pmi", "tushare_hsgt_moneyflow"]
     important_market = ["index_spot", "index_pe", "csindex_valuation", "north", "fund_flow", "hot_rank", "hot_up", "fx", "fx_boc_safe"]
     important_global = ["dxy", "commodity", "us_rate", "us_cpi", "us_core_cpi", "us_nonfarm", "us_unemployment", "us_ism_pmi", "cn_us_rate_spread"]
+    freshness_groups = {
+        "macro": macro,
+        "tushare": tushare_data,
+        "market": market,
+        "global": global_data,
+        "eastmoney_mx": mx,
+        "news": {"news": news, "xinwen_lianbo": xinwen_lianbo},
+    }
     return {
         "overview_scores": {key: value.__dict__ for key, value in scores.items()},
         "coverage": coverage,
@@ -353,6 +443,7 @@ def build_ai_snapshot(bundle, scores):
         "hot_news": dataset_summary(news, recent_rows=18, max_text_chars=220),
         "risk_evidence_database": risk_evidence_database({"macro": macro, "tushare": tushare_data, "market": market, "global": global_data}),
         "role_data_map": ROLE_DATA_MAP,
+        "data_freshness_audit": data_freshness_for_ai(freshness_groups, refresh_log),
         "refresh_log_latest": refresh_log.head(12).to_dict(orient="records") if not refresh_log.empty else [],
     }
 

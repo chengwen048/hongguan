@@ -952,6 +952,29 @@ DATASET_FREQUENCY = {
     "mx_finance": "daily",
 }
 
+DATASET_FALLBACK_ACTIONS = {
+    "pmi": "AKShare 源曾停在旧月份；优先用 Tushare PMI 核对，保留 AKShare 作历史对照。",
+    "cpi": "AKShare 源曾停在旧月份；优先用 Tushare CPI 核对，保留 AKShare 作历史对照。",
+    "ppi": "AKShare 源曾停在旧月份；优先用 Tushare PPI 核对，保留 AKShare 作历史对照。",
+    "m2": "AKShare 源曾停在旧月份；优先用 Tushare M2 核对，保留 AKShare 作历史对照。",
+    "exports": "海关月度数据可能接口滞后；若 AKShare 旧，用新闻/政策和 Tushare 同类宏观口径辅助判断外需。",
+    "imports": "海关月度数据可能接口滞后；若 AKShare 旧，用新闻/政策和 Tushare 同类宏观口径辅助判断内需。",
+    "real_estate": "地产景气指数发布和接口同步较慢；同时参考新房价格、财政收入、政策新闻和风险库。",
+    "fx_reserves": "外储为月度发布；若 AKShare 外储滞后，用人民币汇率长序列和美元指数作为外部压力替代验证。",
+    "retail": "已在抓取层补 date/value；若接口列结构变化，页面和 AI 仍读取原始表格。",
+    "investment": "已在抓取层补 date/value；若接口列结构变化，页面和 AI 仍读取原始表格。",
+    "social_financing": "已在抓取层补 date/value；同时优先使用 Tushare 社融月度数据作为流动性核心口径。",
+    "lpr": "已在抓取层补 date/value；日频展示按最近公布日判断，不要求每天变化。",
+    "commodity_price": "商务部大宗价格指数常无标准日期列；已在抓取层补抓取日期，作为辅助指标。",
+    "a_spot": "行情快照可能无日期列；刷新成功时按最近抓取时间判断。",
+    "index_spot": "行情快照可能无日期列；刷新成功时按最近抓取时间判断。",
+    "hot_rank": "热度榜常无日期列；刷新成功时按最近抓取时间判断。",
+    "hot_up": "热度榜常无日期列；若东方财富/雪球失败，保留历史缓存并用新闻联播/妙想资讯核对热点。",
+    "fund_flow": "东方财富资金流接口偶发 502；失败时保留历史缓存，并用妙想金融数据/热点榜交叉验证行业方向。",
+    "commodity": "东方财富全球商品接口偶发超时；失败时保留历史缓存，并用国内大宗价格指数和美元/美债辅助验证。",
+    "dxy": "美元指数源可能只返回快照；刷新成功时按最近抓取时间判断。",
+}
+
 
 def dataset_latest_timestamp(df: pd.DataFrame) -> tuple[pd.Timestamp | None, str]:
     if df is None or df.empty:
@@ -961,6 +984,9 @@ def dataset_latest_timestamp(df: pd.DataFrame) -> tuple[pd.Timestamp | None, str
             continue
         raw = df[col].astype(str)
         normalized = raw.str.replace("Q1", "-03-01", regex=False).str.replace("Q2", "-06-01", regex=False).str.replace("Q3", "-09-01", regex=False).str.replace("Q4", "-12-01", regex=False)
+        zh_month = normalized.str.extract(r"(?P<year>\d{4})年(?P<month>\d{1,2})月")
+        has_zh_month = zh_month["year"].notna()
+        normalized.loc[has_zh_month] = zh_month.loc[has_zh_month, "year"] + "-" + zh_month.loc[has_zh_month, "month"].str.zfill(2) + "-01"
         mask8 = normalized.str.fullmatch(r"\d{8}")
         normalized.loc[mask8] = normalized.loc[mask8].str[:4] + "-" + normalized.loc[mask8].str[4:6] + "-" + normalized.loc[mask8].str[6:8]
         mask6 = normalized.str.fullmatch(r"\d{6}")
@@ -994,14 +1020,26 @@ def freshness_status(dataset: str, result: DataResult, refresh_row: dict[str, An
     max_days, note = FRESHNESS_PROFILES[freq]
     if latest_ts is None:
         if freq == "snapshot":
+            if refresh_status_value == "ok":
+                return "正常", None, f"{note}；最近刷新成功，按刷新时间判断"
             return "实时快照 / 无日期字段", None, note
         return "有数据但无日期字段", None, "无法判断数据新鲜度，需检查字段结构"
     lag_days = int((pd.Timestamp(datetime.now().date()) - latest_ts.normalize()).days)
+    if error or refresh_status_value == "error":
+        return "使用历史缓存 / 源异常", lag_days, error[:180] or "最近刷新失败，当前展示本地缓存"
     if lag_days <= max_days:
         return "正常", lag_days, note
     if lag_days <= max_days * 2:
         return "偏旧 / 需关注", lag_days, f"{note}；已超过预期窗口"
     return "明显滞后 / 需要替代源", lag_days, f"{note}；滞后时间过长，建议补备用接口"
+
+
+def freshness_action(dataset: str, status_text: str, refresh_row: dict[str, Any]) -> str:
+    if status_text == "正常":
+        return "无需处理，继续半小时增量更新。"
+    if status_text == "使用历史缓存 / 源异常":
+        return DATASET_FALLBACK_ACTIONS.get(dataset, "接口临时失败，保留历史缓存；下轮自动重试，必要时补替代源。")
+    return DATASET_FALLBACK_ACTIONS.get(dataset, "继续自动重试；若连续滞后，优先补同口径备用接口并在 AI 输入中标注口径。")
 
 
 def build_freshness_table(macro, tushare_data, market, global_data, mx_data, news, xinwen_lianbo, refresh_log: pd.DataFrame) -> pd.DataFrame:
@@ -1032,6 +1070,7 @@ def build_freshness_table(macro, tushare_data, market, global_data, mx_data, new
                     "最近刷新时间": refresh_row.get("created_at", ""),
                     "最近刷新状态": refresh_row.get("status", ""),
                     "说明/错误": (str(refresh_row.get("error") or note))[:240],
+                    "处理方案": freshness_action(dataset, status_text, refresh_row),
                 }
             )
     return pd.DataFrame(rows)
@@ -1058,9 +1097,10 @@ def render_freshness_page(freshness_df: pd.DataFrame):
         "明显滞后 / 需要替代源": 1,
         "偏旧 / 需关注": 2,
         "有数据但无日期字段": 3,
-        "实时快照 / 无日期字段": 4,
-        "无数据 / 等待首次落库": 5,
-        "正常": 6,
+        "使用历史缓存 / 源异常": 4,
+        "实时快照 / 无日期字段": 5,
+        "无数据 / 等待首次落库": 6,
+        "正常": 7,
     }
     filtered["_order"] = filtered["新鲜度状态"].map(status_order).fillna(9)
     filtered = filtered.sort_values(["_order", "分组", "数据集"]).drop(columns=["_order"])

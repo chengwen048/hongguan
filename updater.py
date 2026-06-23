@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import subprocess
 import sys
@@ -58,6 +59,7 @@ def refresh_group(group_name: str) -> dict[str, dict[str, int]]:
     inserted = sum(item["inserted"] for item in stats.values())
     updated = sum(item["updated"] for item in stats.values())
     print(f"[{datetime.now().isoformat(timespec='seconds')}] {group_name} 完成：新增 {inserted} 行，更新 {updated} 行", flush=True)
+    print(f"__MACRO_STATS__={stats!r}", flush=True)
     return stats
 
 
@@ -77,6 +79,12 @@ def refresh_once() -> dict[str, dict[str, int]]:
             result = subprocess.run(cmd, cwd=Path(__file__).resolve().parent, text=True, capture_output=True, timeout=GROUP_TIMEOUT_SECONDS)
             if result.stdout:
                 print(result.stdout.rstrip(), flush=True)
+                for line in result.stdout.splitlines():
+                    if line.startswith("__MACRO_STATS__="):
+                        try:
+                            all_stats.update(ast.literal_eval(line.split("=", 1)[1]))
+                        except Exception:
+                            pass
             if result.stderr:
                 print(result.stderr.rstrip(), flush=True)
             if result.returncode != 0:
