@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/
+*.log
+data/
+logs/
+output/
+tmp/
+*.pid
+*.out
+*.err
+.DS_Store
+assets/test_report_export.pdf
